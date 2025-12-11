@@ -1,10 +1,9 @@
 import { providers, Wallet, Contract } from "ethers";
 import { FlashbotsBundleProvider } from "@flashbots/ethers-provider-bundle";
-import { TransactionResponse } from "@ethersproject/providers";
 import { BigNumber } from "@ethersproject/bignumber";
-import { formatEther, parseEther } from "@ethersproject/units"; // Utility for ETH/Wei conversion
+import { formatEther, parseEther } from "@ethersproject/units"; 
 
-// --- NEW CONFIG INTERFACES ---
+// --- Configuration Interfaces ---
 interface FlashbotsConfig {
     relayUrl: string;
     relaySignerKey: string;
@@ -15,14 +14,21 @@ interface ExecutorConfig {
     rpcWssUrl: string;    
     walletPrivateKey: string;
     flashbots: FlashbotsConfig;
-    flashLoanContractAddress: string; // NEW: Address of your deployed Solidity contract
-    flashLoanContractABI: any[];      // NEW: ABI of your deployed Solidity contract
+    flashLoanContractAddress: string; 
+    flashLoanContractABI: any[];      
 }
 
-// --- NEW HYPOTHETICAL CONSTANTS ---
-const TARGET_TOKEN_ADDRESS = "0xC02aaA39b223FE8D0A0e5C4F27EAD9083C756Cc2"; // Example: WETH Address
-const MAX_LOAN_AMOUNT_ETH = 100000; // Max loan the bot will request (e.g., 100,000 ETH)
-const AI_THRESHOLD = 0.85; // Only execute if the AI confidence score is above this
+// --- DEX Reserves ABI (Used for profit calculation) ---
+const I_UNISWAP_V2_PAIR_ABI = [
+    "function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)",
+];
+// NOTE: Replace these with the actual addresses of two different DEX pairs for your chosen token (e.g., WETH/USDC)
+const DEX_A_PAIR_ADDRESS = "0xA478c2975ab1Ea89e8196811F51A7B9429c786c9"; 
+const DEX_B_PAIR_ADDRESS = "0x06da0fdE810a9f5B4C72B3C84b2F823eF69f8480"; 
+const TARGET_TOKEN_ADDRESS = "0xC02aaA39b223FE8D0A0e5C4F27EAD9083C756Cc2"; 
+
+const MAX_LOAN_AMOUNT_ETH = 100000; 
+const AI_THRESHOLD = 0.85; 
 
 export class FlashbotsMEVExecutor {
     private provider: providers.JsonRpcProvider;
@@ -30,18 +36,14 @@ export class FlashbotsMEVExecutor {
     private wallet: Wallet;
     private flashbotsProvider: FlashbotsBundleProvider | undefined;
     private nonce: number | undefined;
-    private flashLoanContract: Contract; // Ethers Contract instance for the deployed Solidity
+    private flashLoanContract: Contract; 
 
     constructor(private config: ExecutorConfig) {
-        // HTTP Provider (Used for read/write and Flashbots submission)
         this.provider = new providers.JsonRpcProvider(config.rpcUrl, 1);
-        
-        // WSS Provider (Used for real-time monitoring of the mempool)
         this.wssProvider = new providers.WebSocketProvider(config.rpcWssUrl, 1);
-
         this.wallet = new Wallet(config.walletPrivateKey, this.provider);
 
-        // NEW: Initialize the Ethers Contract instance for your Flash Loan logic
+        // Initializes the contract instance to call the deployed Solidity code
         this.flashLoanContract = new Contract(
             config.flashLoanContractAddress, 
             config.flashLoanContractABI, 
@@ -54,44 +56,29 @@ export class FlashbotsMEVExecutor {
         await this.provider.getBlockNumber(); 
         console.log("[INFO] Successful connection to RPC provider.");
 
-        console.log("[INFO] Initializing Flashbots executor...");
-        
         const authSigner = new Wallet(this.config.flashbots.relaySignerKey, this.provider);
-        
         this.flashbotsProvider = await FlashbotsBundleProvider.create(
-            this.provider,                 
-            authSigner,                    
-            this.config.flashbots.relayUrl,
-            "mainnet" 
+            this.provider, authSigner, this.config.flashbots.relayUrl, "mainnet" 
         );
 
         this.nonce = await this.provider.getTransactionCount(this.wallet.address);
         console.log(`[INFO] Initialized nonce to ${this.nonce}`);
-        
         console.log("[INFO] Flashbots executor ready.");
     }
 
     public async startMonitoring() {
-        if (!this.flashbotsProvider) {
-            throw new Error("Flashbots executor not initialized.");
-        }
+        if (!this.flashbotsProvider) throw new Error("Flashbots executor not initialized.");
         console.log("[INFO] [STEP 3] Full system operational. Monitoring mempool...");
 
-        // Start listening to pending transactions via the WSS connection
         this.wssProvider.on('pending', async (txHash: string) => {
-            // console.log(`[MEMPOOL] Detected pending transaction: ${txHash}`);
-            
-            // 1. Fetch Transaction Details
             const tx = await this.wssProvider.getTransaction(txHash);
             if (!tx || !tx.data) return; 
 
-            // 2. Analyze and Score the Opportunity (AI Optimization)
             const { isProfitable, estimatedProfit, aiScore } = await this.analyzeOpportunity(tx);
             
             if (isProfitable) {
-                console.log(`[OPPORTUNITY] Found arbitrage! Profit: ${formatEther(estimatedProfit)}, AI Score: ${aiScore}`);
+                console.log(`[OPPORTUNITY] Found arbitrage! Profit: ${formatEther(estimatedProfit)}, AI Score: ${aiScore.toFixed(2)}`);
 
-                // 3. AI Filter: Only proceed if the AI gives a high confidence score
                 if (aiScore > AI_THRESHOLD) {
                     await this.executeFlashLoan(tx, estimatedProfit); 
                 } else {
@@ -104,37 +91,33 @@ export class FlashbotsMEVExecutor {
             console.error('[WSS ERROR] WebSocket Provider Encountered an Error:', error);
         });
 
-        // Health check logs to confirm the process is still active
+        // Health Check Loop
         let healthCheckCount = 0;
         setInterval(() => {
             healthCheckCount++;
             console.log(`[MONITOR] Mempool monitoring is alive. Check #${healthCheckCount}`);
-            this.periodicResync(); // Keep the nonce fresh
+            this.periodicResync();
         }, 10000); 
     }
 
     private async executeFlashLoan(targetTx: any, estimatedProfit: BigNumber): Promise<void> {
-        if (!this.flashbotsProvider) throw new Error("Executor not ready.");
+        if (!this.flashbotsProvider || this.nonce === undefined) throw new Error("Executor or nonce not ready.");
 
-        // 1. Dynamic Loan Amount Calculation (Higher profit chance -> Higher loan amount)
+        // 1. Dynamic Loan Amount Calculation
         const MAX_LOAN_WEI = parseEther(String(MAX_LOAN_AMOUNT_ETH));
-        
-        // Strategy: Base the loan on 10x the expected profit, up to the maximum cap.
-        let loanAmount = estimatedProfit.mul(10); 
-        
+        let loanAmount = estimatedProfit.mul(10); // Strategy: 10x the expected profit
         if (loanAmount.gt(MAX_LOAN_WEI)) {
             loanAmount = MAX_LOAN_WEI;
         }
         
         console.log(`[FLASH LOAN] Loan amount: ${formatEther(loanAmount)} ETH. Nonce: ${this.nonce}`);
 
-        // 2. Construct Transaction to Call Solidity Contract
-        // The transaction calls the function in your deployed contract that initiates the loan/trade.
+        // 2. Construct Transaction to Call Solidity Contract (requestFlashLoan)
         const flashLoanTx = await this.flashLoanContract.populateTransaction.requestFlashLoan(
             TARGET_TOKEN_ADDRESS, 
             loanAmount,
-            // Additional parameters required by your Solidity contract for the trade
-            Buffer.from('0x') // Placeholder for custom calldata
+            // Data parameter carries the instructions for the contract's executeOperation function
+            targetTx.data // Using the victim's data as a placeholder instruction
         );
 
         // 3. Submit Bundle
@@ -143,9 +126,8 @@ export class FlashbotsMEVExecutor {
                 signer: this.wallet, 
                 transaction: {
                     ...flashLoanTx,
-                    nonce: this.nonce, // Use current nonce
-                    gasLimit: 3000000, // Sufficiently high gas limit for complex flash loan
-                    // Note: Flashbots often handle gas pricing internally for best execution
+                    nonce: this.nonce,
+                    gasLimit: 3000000, 
                 }
             }
         ]);
@@ -159,29 +141,47 @@ export class FlashbotsMEVExecutor {
         }
         
         await this.flashbotsProvider.sendBundle(signedTransactions, targetBlock);
+        console.log(`[SUCCESS] Flash Loan Bundle submitted for block ${targetBlock}`);
         
-        console.log(`[SUCCESS] Flash Loan Bundle submitted for block ${targetBlock} with loan of ${formatEther(loanAmount)}`);
-
-        // Important: Increment nonce ONLY AFTER successful submission
-        if (this.nonce !== undefined) {
-            this.nonce++;
-        }
+        this.nonce++;
     }
 
-    // NEW: Function to analyze opportunity and fetch AI score (This requires external services!)
+    // --- 🔑 Real-Time Profit and AI Optimization Logic ---
     private async analyzeOpportunity(tx: any): Promise<{ isProfitable: boolean, estimatedProfit: BigNumber, aiScore: number }> {
-        // --- THIS LOGIC MUST BE BUILT OUT ---
-        // 1. Query multiple DEXs (via APIs or RPC calls) to check for triangular arbitrage.
-        // 2. Calculate the potential profit considering slippage, fees, and flash loan costs (0.09%).
-        // 3. Query your external AI service (e.g., a Python Flask API) for the prediction score.
+        // --- 1. Real-Time Price Check (DEX Reserves) ---
+        const pairA = new Contract(DEX_A_PAIR_ADDRESS, I_UNISWAP_V2_PAIR_ABI, this.provider);
+        const pairB = new Contract(DEX_B_PAIR_ADDRESS, I_UNISWAP_V2_PAIR_ABI, this.provider);
 
-        // Placeholder for demonstration:
-        const isProfitable = Math.random() < 0.1; // 10% chance of being "profitable"
-        const estimatedProfit = parseEther(String(Math.random() * 0.5)); // Random profit up to 0.5 ETH
-        const aiScore = isProfitable ? Math.random() * 0.3 + 0.7 : Math.random() * 0.5; // High score if profitable
-        // ---------------------------------
+        let reservesA: any, reservesB: any;
+        try {
+            [reservesA, reservesB] = await Promise.all([
+                pairA.getReserves(),
+                pairB.getReserves()
+            ]);
+        } catch (e) {
+            return { isProfitable: false, estimatedProfit: BigNumber.from(0), aiScore: 0 };
+        }
+        
+        // This is a simplified calculation: difference in prices * estimated volume
+        const priceA = reservesA[0].mul(parseEther("1")).div(reservesA[1]);
+        const priceB = reservesB[0].mul(parseEther("1")).div(reservesB[1]);
+        
+        const difference = priceA.sub(priceB).abs();
+        const MIN_PROFIT_THRESHOLD = parseEther("0.05");
 
-        return { isProfitable, estimatedProfit, aiScore };
+        if (difference.gt(priceA.div(100))) { // Arbitrage potential if > 1% difference
+            const potentialProfit = difference.div(100).mul(parseEther("1")); // Estimate based on price diff
+            
+            if (potentialProfit.gt(MIN_PROFIT_THRESHOLD)) {
+                // --- 2. AI Score (Hypothetical API Call) ---
+                // In a real bot, you call a separate Python/ML service here to get a score.
+                const aiScore = Math.random() * 0.4 + 0.6; // Placeholder: Score between 0.6 and 1.0
+                
+                return { isProfitable: true, estimatedProfit: potentialProfit, aiScore };
+            }
+        }
+        
+        return { isProfitable: false, estimatedProfit: BigNumber.from(0), aiScore: 0 };
     }
     
     public async periodicResync(): Promise<void> {
@@ -189,7 +189,6 @@ export class FlashbotsMEVExecutor {
         const newNonce = await this.provider.getTransactionCount(this.wallet.address);
         if (this.nonce === undefined || newNonce > this.nonce) {
             this.nonce = newNonce;
-            // console.log(`[INFO] Nonce resynced to ${this.nonce}`);
         }
     }
 }
