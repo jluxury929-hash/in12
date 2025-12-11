@@ -1,5 +1,3 @@
-// index.ts (IN ROOT DIRECTORY)
-
 import * as dotenv from 'dotenv';
 dotenv.config();
 
